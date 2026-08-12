@@ -17,6 +17,42 @@ function value(line, key) {
   return line?.match(new RegExp(`${key}(?:=|:)\\s*'([^']*)'`))?.[1] || ''
 }
 
+function isRasterIcon(filePath) {
+  return /\.(?:png|webp|jpe?g)$/i.test(filePath)
+}
+
+function iconScore(filePath, preferredNames) {
+  const normalized = filePath.toLowerCase()
+  const name = path.basename(normalized, path.extname(normalized))
+  let score = preferredNames.includes(name) ? 1000 : 0
+  if (/mipmap/.test(normalized)) score += 100
+  if (/xxxhdpi/.test(normalized)) score += 60
+  else if (/xxhdpi/.test(normalized)) score += 50
+  else if (/xhdpi/.test(normalized)) score += 40
+  else if (/hdpi/.test(normalized)) score += 30
+  else if (/mdpi/.test(normalized)) score += 20
+  if (/launcher|app_icon|icon/.test(name)) score += 10
+  return score
+}
+
+async function resolveIcon(fullPath, declaredIcons) {
+  const rasterDeclared = declaredIcons.filter(isRasterIcon)
+  if (rasterDeclared.length) return rasterDeclared.at(-1)
+
+  const preferredNames = declaredIcons.map((icon) => path.basename(icon, path.extname(icon)).toLowerCase())
+  const { stdout } = await execFileAsync('unzip', ['-Z1', fullPath], { maxBuffer: 8 * 1024 * 1024 })
+  const rasterFiles = stdout
+    .split('\n')
+    .map((entry) => entry.trim())
+    .filter((entry) => /^res\//.test(entry) && isRasterIcon(entry))
+    .filter((entry) => {
+      const name = path.basename(entry, path.extname(entry)).toLowerCase()
+      return preferredNames.includes(name) || /launcher|app_icon/.test(name)
+    })
+
+  return rasterFiles.sort((a, b) => iconScore(b, preferredNames) - iconScore(a, preferredNames))[0] || ''
+}
+
 async function parseApk(fileName) {
   const fullPath = path.join(apkDirectory, fileName)
   const fileStat = await stat(fullPath)
@@ -33,6 +69,8 @@ async function parseApk(fileName) {
   })
   const id = Buffer.from(fileName).toString('base64url')
 
+  const iconPath = await resolveIcon(fullPath, iconCandidates)
+
   return {
     id,
     name: value(localizedAppLine, 'application-label-zh') || value(appLine, 'application-label') || path.basename(fileName, path.extname(fileName)),
@@ -45,8 +83,8 @@ async function parseApk(fileName) {
     fullPath,
     size: fileStat.size,
     modifiedAt: fileStat.mtime.toISOString(),
-    iconPath: iconCandidates.at(-1) || '',
-    hasIcon: iconCandidates.length > 0,
+    iconPath,
+    hasIcon: Boolean(iconPath),
   }
 }
 
