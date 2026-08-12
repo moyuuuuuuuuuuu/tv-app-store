@@ -204,9 +204,23 @@ app.get('/api/apps/:id/icon', async (request, response) => {
       await execFileAsync('unzip', ['-j', item.fullPath, item.iconPath, '-d', directory])
       const iconFile = path.join(directory, path.basename(item.iconPath))
       const extension = path.extname(iconFile).toLowerCase()
+      let responseFile = iconFile
+
+      // iOS stores many app icons as CgBI PNGs. Browsers cannot decode these
+      // directly, so restore them to regular PNG before sending the response.
+      if (item.platform === 'ios' && extension === '.png') {
+        const convertedFile = path.join(directory, `converted-${path.basename(iconFile)}`)
+        try {
+          await execFileAsync('pngcrush', ['-q', '-revert-iphone-optimizations', iconFile, convertedFile])
+          responseFile = convertedFile
+        } catch {
+          // Some IPA icons already use standard PNG; serve the original in that case.
+        }
+      }
+
       response.type(extension === '.webp' ? 'image/webp' : extension === '.jpg' || extension === '.jpeg' ? 'image/jpeg' : 'image/png')
       response.set('Cache-Control', 'public, max-age=3600')
-      createReadStream(iconFile).on('close', () => rm(directory, { recursive: true, force: true })).pipe(response)
+      createReadStream(responseFile).on('close', () => rm(directory, { recursive: true, force: true })).pipe(response)
     } catch (error) {
       await rm(directory, { recursive: true, force: true })
       throw error
