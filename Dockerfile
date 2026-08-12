@@ -1,7 +1,10 @@
 FROM node:22-bookworm-slim AS build
 WORKDIR /app
-COPY package*.json ./
-RUN npm install
+ENV NPM_CONFIG_UPDATE_NOTIFIER=false \
+    NPM_CONFIG_FUND=false \
+    NPM_CONFIG_AUDIT=false
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 COPY index.html vite.config.js ./
 COPY src ./src
 RUN npm run build
@@ -11,9 +14,15 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends aapt unzip \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-ENV NODE_ENV=production PORT=3000 APK_DIR=/apks
-COPY package*.json ./
-RUN npm install --omit=dev && npm cache clean --force
+ENV NODE_ENV=production \
+    PORT=3000 \
+    APK_DIR=/apks \
+    NPM_CONFIG_UPDATE_NOTIFIER=false \
+    NPM_CONFIG_FUND=false \
+    NPM_CONFIG_AUDIT=false
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund \
+    && npm cache clean --force
 COPY server ./server
 COPY --from=build /app/dist ./dist
 RUN mkdir -p /apks && chown -R node:node /app /apks

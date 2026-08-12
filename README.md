@@ -10,6 +10,13 @@ mkdir -p apks
 docker compose up -d --build
 ```
 
+如果曾经构建失败并留下损坏缓存，可使用无缓存方式重新构建：
+
+```bash
+docker compose build --no-cache
+docker compose up -d
+```
+
 打开 <http://localhost:3000>。
 
 默认映射关系：
