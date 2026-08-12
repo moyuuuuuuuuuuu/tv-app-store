@@ -1,0 +1,12 @@
+services:
+  tv-app-store:
+    build: .
+    container_name: tv-app-store
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - "./apks:/apks:ro"
+    environment:
+      PORT: 3000
+      APK_DIR: /apks
