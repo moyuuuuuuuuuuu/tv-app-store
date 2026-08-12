@@ -1,6 +1,6 @@
 # TV App Store
 
-扫描指定目录中的 APK，使用 `aapt` 解析应用名称、包名、版本、SDK、大小和图标，并通过 Vue 页面展示和下载。
+扫描指定目录中的 APK、IPA 和 DMG 文件，通过 Vue 页面展示平台、应用信息并提供下载。APK 使用 `aapt` 解析，IPA 从 `Info.plist` 读取元数据；DMG 作为 macOS 安装镜像展示基础文件信息。
 
 ## Docker Compose 运行
 

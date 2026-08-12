@@ -85,13 +85,97 @@ async function parseApk(fileName) {
     modifiedAt: fileStat.mtime.toISOString(),
     iconPath,
     hasIcon: Boolean(iconPath),
+    platform: 'android',
+    platformLabel: 'Android',
   }
+}
+
+async function parseIpa(fileName) {
+  const fullPath = path.join(apkDirectory, fileName)
+  const fileStat = await stat(fullPath)
+  const { stdout: fileList } = await execFileAsync('unzip', ['-Z1', fullPath], { maxBuffer: 8 * 1024 * 1024 })
+  const entries = fileList.split('\n').map((entry) => entry.trim()).filter(Boolean)
+  const infoPath = entries.find((entry) => /^Payload\/[^/]+\.app\/Info\.plist$/i.test(entry))
+  let info = {}
+
+  if (infoPath) {
+    const directory = await mkdtemp(path.join(tmpdir(), 'ipa-info-'))
+    try {
+      await execFileAsync('unzip', ['-j', fullPath, infoPath, '-d', directory])
+      const plistPath = path.join(directory, path.basename(infoPath))
+      const script = [
+        'import json, plistlib, sys',
+        'with open(sys.argv[1], "rb") as f: p = plistlib.load(f)',
+        'keys = ["CFBundleDisplayName", "CFBundleName", "CFBundleIdentifier", "CFBundleShortVersionString", "CFBundleVersion", "MinimumOSVersion"]',
+        'print(json.dumps({k: p.get(k, "") for k in keys}, ensure_ascii=False))',
+      ].join('\n')
+      const { stdout } = await execFileAsync('python3', ['-c', script, plistPath])
+      info = JSON.parse(stdout)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  }
+
+  const appRoot = infoPath?.slice(0, infoPath.lastIndexOf('/') + 1) || ''
+  const iconCandidates = entries.filter((entry) =>
+    entry.startsWith(appRoot) && !entry.slice(appRoot.length).includes('/') && /(?:appicon|icon).*\.png$/i.test(entry),
+  )
+  const iconPath = iconCandidates.sort((a, b) => iconScore(b, ['appicon']) - iconScore(a, ['appicon']))[0] || ''
+
+  return {
+    id: Buffer.from(fileName).toString('base64url'),
+    name: info.CFBundleDisplayName || info.CFBundleName || path.basename(fileName, path.extname(fileName)),
+    packageName: info.CFBundleIdentifier || '',
+    versionCode: info.CFBundleVersion || '',
+    versionName: info.CFBundleShortVersionString || '',
+    minSdk: info.MinimumOSVersion || '',
+    targetSdk: '',
+    fileName,
+    fullPath,
+    size: fileStat.size,
+    modifiedAt: fileStat.mtime.toISOString(),
+    iconPath,
+    hasIcon: Boolean(iconPath),
+    platform: 'ios',
+    platformLabel: 'iOS',
+  }
+}
+
+async function parseDmg(fileName) {
+  const fullPath = path.join(apkDirectory, fileName)
+  const fileStat = await stat(fullPath)
+  return {
+    id: Buffer.from(fileName).toString('base64url'),
+    name: path.basename(fileName, path.extname(fileName)),
+    packageName: '',
+    versionCode: '',
+    versionName: '',
+    minSdk: '',
+    targetSdk: '',
+    fileName,
+    fullPath,
+    size: fileStat.size,
+    modifiedAt: fileStat.mtime.toISOString(),
+    iconPath: '',
+    hasIcon: false,
+    platform: 'macos',
+    platformLabel: 'macOS',
+  }
+}
+
+function parsePackage(fileName) {
+  const extension = path.extname(fileName).toLowerCase()
+  if (extension === '.apk') return parseApk(fileName)
+  if (extension === '.ipa') return parseIpa(fileName)
+  return parseDmg(fileName)
 }
 
 async function scan() {
   const entries = await readdir(apkDirectory, { withFileTypes: true })
-  const apkFiles = entries.filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.apk')).map((entry) => entry.name)
-  const results = await Promise.allSettled(apkFiles.map(parseApk))
+  const packageFiles = entries
+    .filter((entry) => entry.isFile() && /\.(?:apk|ipa|dmg)$/i.test(entry.name))
+    .map((entry) => entry.name)
+  const results = await Promise.allSettled(packageFiles.map(parsePackage))
   const parsed = results.filter((result) => result.status === 'fulfilled').map((result) => result.value)
   cache = new Map(parsed.map((item) => [item.id, item]))
   return parsed.sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'))

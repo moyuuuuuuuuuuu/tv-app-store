@@ -10,7 +10,7 @@ const filteredApps = computed(() => {
   const value = query.value.trim().toLowerCase()
   if (!value) return apps.value
   return apps.value.filter((app) =>
-    [app.name, app.packageName, app.fileName].some((field) => field?.toLowerCase().includes(value)),
+    [app.name, app.packageName, app.fileName, app.platformLabel].some((field) => field?.toLowerCase().includes(value)),
   )
 })
 
@@ -50,7 +50,7 @@ onMounted(loadApps)
       <div>
         <p class="eyebrow">LOCAL APK LIBRARY</p>
         <h1>电视应用仓库</h1>
-        <p class="subtitle">浏览挂载目录中的 Android 安装包</p>
+        <p class="subtitle">浏览挂载目录中的 Android 与 Apple 安装包</p>
       </div>
       <button class="refresh" :disabled="loading" @click="loadApps">
         <span :class="{ spin: loading }">↻</span> 刷新目录
@@ -60,7 +60,7 @@ onMounted(loadApps)
     <section class="toolbar">
       <label class="search">
         <span>⌕</span>
-        <input v-model="query" placeholder="搜索应用名称、包名或文件名" />
+        <input v-model="query" placeholder="搜索应用名称、包名、平台或文件名" />
       </label>
       <div class="count"><strong>{{ filteredApps.length }}</strong> 个应用</div>
     </section>
@@ -70,7 +70,7 @@ onMounted(loadApps)
     <div v-else-if="!filteredApps.length" class="empty">
       <div class="empty-icon">APK</div>
       <h2>{{ query ? '没有匹配的应用' : '目录中还没有 APK' }}</h2>
-      <p>{{ query ? '试试其他关键词' : '将 .apk 文件放入已挂载的 APK 目录后点击刷新' }}</p>
+      <p>{{ query ? '试试其他关键词' : '将 APK、IPA 或 DMG 文件放入挂载目录后点击刷新' }}</p>
     </div>
 
     <section v-else class="grid">
@@ -81,9 +81,10 @@ onMounted(loadApps)
           <h2 :title="app.name">{{ app.name }}</h2>
           <p class="package" :title="app.packageName">{{ app.packageName }}</p>
           <div class="tags">
+            <span class="platform" :class="app.platform">{{ app.platformLabel }}</span>
             <span>v{{ app.versionName || app.versionCode || '-' }}</span>
             <span>{{ formatSize(app.size) }}</span>
-            <span v-if="app.minSdk">Android {{ app.minSdk }}+</span>
+            <span v-if="app.minSdk">{{ app.platform === 'android' ? 'Android' : 'iOS' }} {{ app.minSdk }}+</span>
           </div>
         </div>
         <footer>
@@ -92,7 +93,7 @@ onMounted(loadApps)
             <time>{{ app.modifiedAt ? new Date(app.modifiedAt).toLocaleDateString('zh-CN') : '' }}</time>
           </div>
           <a class="download" :href="`/api/apps/${app.id}/download`" :download="app.fileName">
-            <span>↓</span> 下载 APK
+            <span>↓</span> 下载 {{ app.fileName.split('.').pop().toUpperCase() }}
           </a>
         </footer>
       </article>
