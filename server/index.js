@@ -20,6 +20,10 @@ function isRasterIcon(filePath) {
   return /\.(?:png|webp|jpe?g)$/i.test(filePath)
 }
 
+function isCgbiPng(buffer) {
+  return buffer.subarray(0, 128).includes(Buffer.from('CgBI'))
+}
+
 async function findFile(directory, predicate) {
   const entries = await readdir(directory, { withFileTypes: true })
   for (const entry of entries) {
@@ -341,12 +345,13 @@ app.get('/api/apps/:id/icon', async (request, response) => {
       // iOS stores many app icons as CgBI PNGs. Browsers cannot decode these
       // directly, so restore them to regular PNG before sending the response.
       if (item.platform === 'ios' && extension === '.png') {
+        const originalIcon = await readFile(iconFile)
         const convertedFile = path.join(directory, `converted-${path.basename(iconFile)}`)
-        try {
+        if (isCgbiPng(originalIcon)) {
           await execFileAsync('pngcrush', ['-q', '-revert-iphone-optimizations', iconFile, convertedFile])
+          const convertedIcon = await readFile(convertedFile)
+          if (isCgbiPng(convertedIcon)) throw new Error('CgBI icon conversion did not produce a browser-compatible PNG')
           responseFile = convertedFile
-        } catch {
-          // Some IPA icons already use standard PNG; serve the original in that case.
         }
       }
 

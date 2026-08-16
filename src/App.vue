@@ -75,7 +75,7 @@ onMounted(loadApps)
 
     <section v-else class="grid">
       <article v-for="app in filteredApps" :key="app.id" class="card">
-        <img v-if="app.hasIcon" class="app-icon" :src="`/api/apps/${app.id}/icon`" alt="" />
+        <img v-if="app.hasIcon" class="app-icon" :src="`/api/apps/${app.id}/icon?v=${encodeURIComponent(app.modifiedAt || app.size)}`" alt="" />
         <div v-else class="app-icon fallback">{{ app.name?.slice(0, 1)?.toUpperCase() || 'A' }}</div>
         <div class="card-main">
           <h2 :title="app.name">{{ app.name }}</h2>
