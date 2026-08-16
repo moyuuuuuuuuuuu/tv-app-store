@@ -1,6 +1,6 @@
 # TV App Store
 
-扫描指定目录中的 APK、IPA 和 DMG 文件，通过 Vue 页面展示平台、应用信息并提供下载。APK 使用 `aapt` 解析，IPA 从 `Info.plist` 读取元数据，并自动将苹果 CgBI 图标转换为浏览器可显示的 PNG；DMG 作为 macOS 安装镜像展示基础文件信息。
+扫描指定目录中的 APK、IPA 和 DMG 文件，通过 Vue 页面展示平台、应用信息、应用图标并提供下载。APK 使用 `aapt` 解析，IPA 从 `Info.plist` 读取元数据，并自动将苹果 CgBI 图标转换为浏览器可显示的 PNG；DMG 会读取应用元数据和 ICNS 图标，并识别 Intel（`x86_64`）、Apple 芯片（`arm64`）或通用架构。
 
 ## Docker Compose 运行
 

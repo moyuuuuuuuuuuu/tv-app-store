@@ -10,7 +10,7 @@ const filteredApps = computed(() => {
   const value = query.value.trim().toLowerCase()
   if (!value) return apps.value
   return apps.value.filter((app) =>
-    [app.name, app.packageName, app.fileName, app.platformLabel].some((field) => field?.toLowerCase().includes(value)),
+    [app.name, app.packageName, app.fileName, app.platformLabel, app.architectureLabel].some((field) => field?.toLowerCase().includes(value)),
   )
 })
 
@@ -84,6 +84,7 @@ onMounted(loadApps)
             <span class="platform" :class="app.platform">{{ app.platformLabel }}</span>
             <span>v{{ app.versionName || app.versionCode || '-' }}</span>
             <span>{{ formatSize(app.size) }}</span>
+            <span v-if="app.architectureLabel" class="architecture">{{ app.architectureLabel }}</span>
             <span v-if="app.minSdk">{{ app.platform === 'android' ? 'Android' : 'iOS' }} {{ app.minSdk }}+</span>
           </div>
         </div>

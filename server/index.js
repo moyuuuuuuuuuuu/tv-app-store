@@ -1,7 +1,6 @@
 import express from 'express'
 import { execFile } from 'node:child_process'
-import { createReadStream } from 'node:fs'
-import { mkdtemp, readdir, rm, stat } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -19,6 +18,124 @@ function value(line, key) {
 
 function isRasterIcon(filePath) {
   return /\.(?:png|webp|jpe?g)$/i.test(filePath)
+}
+
+async function findFile(directory, predicate) {
+  const entries = await readdir(directory, { withFileTypes: true })
+  for (const entry of entries) {
+    const fullPath = path.join(directory, entry.name)
+    if (entry.isDirectory()) {
+      const match = await findFile(fullPath, predicate)
+      if (match) return match
+    } else if (entry.isFile() && predicate(fullPath)) {
+      return fullPath
+    }
+  }
+  return ''
+}
+
+async function readPlist(plistPath, keys) {
+  const script = [
+    'import json, plistlib, sys',
+    'with open(sys.argv[1], "rb") as f: p = plistlib.load(f)',
+    `keys = ${JSON.stringify(keys)}`,
+    'print(json.dumps({k: p.get(k, "") for k in keys}, ensure_ascii=False))',
+  ].join('\n')
+  const { stdout } = await execFileAsync('python3', ['-c', script, plistPath])
+  return JSON.parse(stdout)
+}
+
+function parseMachOArchitectures(buffer) {
+  if (buffer.length < 8) return []
+  const magic = buffer.readUInt32BE(0)
+  const thinArchitectures = new Map([
+    [0xfeedface, { endian: 'BE', offset: 4 }],
+    [0xcefaedfe, { endian: 'LE', offset: 4 }],
+    [0xfeedfacf, { endian: 'BE', offset: 4 }],
+    [0xcffaedfe, { endian: 'LE', offset: 4 }],
+  ])
+  const cpuName = (cpuType) => {
+    const normalized = cpuType >>> 0
+    if (normalized === 0x01000007) return 'x86_64'
+    if (normalized === 0x0100000c) return 'arm64'
+    return ''
+  }
+
+  if (thinArchitectures.has(magic)) {
+    const { endian, offset } = thinArchitectures.get(magic)
+    const cpuType = endian === 'BE' ? buffer.readUInt32BE(offset) : buffer.readUInt32LE(offset)
+    return [cpuName(cpuType)].filter(Boolean)
+  }
+
+  const fatEndian = magic === 0xcafebabe || magic === 0xcafebabf ? 'BE'
+    : magic === 0xbebafeca || magic === 0xbfbafeca ? 'LE' : ''
+  if (!fatEndian) return []
+  const readUInt32 = fatEndian === 'BE' ? Buffer.prototype.readUInt32BE : Buffer.prototype.readUInt32LE
+  const count = readUInt32.call(buffer, 4)
+  const stride = magic === 0xcafebabf || magic === 0xbfbafeca ? 32 : 20
+  const architectures = []
+  for (let index = 0; index < count && 8 + index * stride + 4 <= buffer.length; index += 1) {
+    const name = cpuName(readUInt32.call(buffer, 8 + index * stride))
+    if (name && !architectures.includes(name)) architectures.push(name)
+  }
+  return architectures
+}
+
+async function withDmgContents(fullPath, callback) {
+  const temporaryDirectory = await mkdtemp(path.join(tmpdir(), 'dmg-info-'))
+  let contentRoot = temporaryDirectory
+  let mountedDevice = ''
+  try {
+    if (process.platform === 'darwin') {
+      const mountPoint = path.join(temporaryDirectory, 'volume')
+      const { stdout } = await execFileAsync('hdiutil', ['attach', '-readonly', '-nobrowse', '-noautoopen', '-mountpoint', mountPoint, fullPath])
+      mountedDevice = stdout.split('\n').map((line) => line.trim().split(/\s+/)[0]).find((device) => /^\/dev\/disk\d+$/.test(device)) || ''
+      contentRoot = mountPoint
+    } else {
+      await execFileAsync('7z', ['x', '-y', `-o${temporaryDirectory}`, fullPath], { maxBuffer: 8 * 1024 * 1024 })
+    }
+
+    return await callback(contentRoot, temporaryDirectory)
+  } finally {
+    if (mountedDevice) await execFileAsync('hdiutil', ['detach', mountedDevice]).catch(() => {})
+    await rm(temporaryDirectory, { recursive: true, force: true })
+  }
+}
+
+async function inspectDmg(fullPath) {
+  return withDmgContents(fullPath, async (contentRoot) => {
+    const infoPath = await findFile(contentRoot, (filePath) => /\.app\/Contents\/Info\.plist$/i.test(filePath))
+    if (!infoPath) return { info: {}, architectures: [], iconPath: '' }
+    const info = await readPlist(infoPath, [
+      'CFBundleDisplayName', 'CFBundleName', 'CFBundleIdentifier', 'CFBundleShortVersionString',
+      'CFBundleVersion', 'LSMinimumSystemVersion', 'CFBundleExecutable', 'CFBundleIconFile',
+    ])
+    const executablePath = path.join(path.dirname(infoPath), 'MacOS', info.CFBundleExecutable || '')
+    let architectures = []
+    if (info.CFBundleExecutable) {
+      const executable = await readFile(executablePath)
+      architectures = parseMachOArchitectures(executable.subarray(0, 4096))
+    }
+    const resourcesPath = path.join(path.dirname(infoPath), 'Resources')
+    const declaredIcon = info.CFBundleIconFile
+      ? path.join(resourcesPath, /\.[^.]+$/.test(info.CFBundleIconFile) ? info.CFBundleIconFile : `${info.CFBundleIconFile}.icns`)
+      : ''
+    let iconFile = declaredIcon && await stat(declaredIcon).then(() => declaredIcon).catch(() => '')
+    if (!iconFile) iconFile = await findFile(resourcesPath, (filePath) => /\.icns$/i.test(filePath)).catch(() => '')
+    const iconPath = iconFile ? path.relative(contentRoot, iconFile) : ''
+    return { info, architectures, iconPath }
+  })
+}
+
+async function renderDmgIcon(fullPath, iconPath, outputPath) {
+  return withDmgContents(fullPath, async (contentRoot) => {
+    const sourcePath = path.join(contentRoot, iconPath)
+    if (process.platform === 'darwin') {
+      await execFileAsync('sips', ['-s', 'format', 'png', sourcePath, '--out', outputPath])
+    } else {
+      await execFileAsync('convert', [`${sourcePath}[0]`, outputPath])
+    }
+  })
 }
 
 function iconScore(filePath, preferredNames) {
@@ -144,20 +261,27 @@ async function parseIpa(fileName) {
 async function parseDmg(fileName) {
   const fullPath = path.join(apkDirectory, fileName)
   const fileStat = await stat(fullPath)
+  const { info, architectures, iconPath } = await inspectDmg(fullPath)
+  const architectureLabel = architectures.includes('arm64') && architectures.includes('x86_64')
+    ? '通用（Intel + Apple 芯片）'
+    : architectures.includes('arm64') ? 'Apple 芯片'
+      : architectures.includes('x86_64') ? 'Intel' : ''
   return {
     id: Buffer.from(fileName).toString('base64url'),
-    name: path.basename(fileName, path.extname(fileName)),
-    packageName: '',
-    versionCode: '',
-    versionName: '',
-    minSdk: '',
+    name: info.CFBundleDisplayName || info.CFBundleName || path.basename(fileName, path.extname(fileName)),
+    packageName: info.CFBundleIdentifier || '',
+    versionCode: info.CFBundleVersion || '',
+    versionName: info.CFBundleShortVersionString || '',
+    minSdk: info.LSMinimumSystemVersion || '',
     targetSdk: '',
+    architectures,
+    architectureLabel,
     fileName,
     fullPath,
     size: fileStat.size,
     modifiedAt: fileStat.mtime.toISOString(),
-    iconPath: '',
-    hasIcon: false,
+    iconPath,
+    hasIcon: Boolean(iconPath),
     platform: 'macos',
     platformLabel: 'macOS',
   }
@@ -201,6 +325,14 @@ app.get('/api/apps/:id/icon', async (request, response) => {
     if (!item?.iconPath) return response.sendStatus(404)
     const directory = await mkdtemp(path.join(tmpdir(), 'apk-icon-'))
     try {
+      if (item.platform === 'macos') {
+        const convertedFile = path.join(directory, 'icon.png')
+        await renderDmgIcon(item.fullPath, item.iconPath, convertedFile)
+        response.type('image/png')
+        response.set('Cache-Control', 'public, max-age=3600')
+        response.send(await readFile(convertedFile))
+        return
+      }
       await execFileAsync('unzip', ['-j', item.fullPath, item.iconPath, '-d', directory])
       const iconFile = path.join(directory, path.basename(item.iconPath))
       const extension = path.extname(iconFile).toLowerCase()
@@ -220,13 +352,13 @@ app.get('/api/apps/:id/icon', async (request, response) => {
 
       response.type(extension === '.webp' ? 'image/webp' : extension === '.jpg' || extension === '.jpeg' ? 'image/jpeg' : 'image/png')
       response.set('Cache-Control', 'public, max-age=3600')
-      createReadStream(responseFile).on('close', () => rm(directory, { recursive: true, force: true })).pipe(response)
-    } catch (error) {
+      response.send(await readFile(responseFile))
+    } finally {
       await rm(directory, { recursive: true, force: true })
-      throw error
     }
-  } catch {
-    response.sendStatus(404)
+  } catch (error) {
+    console.warn(`Unable to extract icon for ${request.params.id}: ${error.message}`)
+    if (!response.headersSent) response.sendStatus(404)
   }
 })
 
