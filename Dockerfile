@@ -12,7 +12,7 @@ RUN npm run build
 
 FROM node:22-bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends aapt binutils icoutils imagemagick libimage-exiftool-perl msitools p7zip-full pngcrush python3 unzip \
+    && apt-get install -y --no-install-recommends aapt binutils icnsutils icoutils imagemagick libimage-exiftool-perl msitools p7zip-full pngcrush python3 unzip \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 ENV NODE_ENV=production \

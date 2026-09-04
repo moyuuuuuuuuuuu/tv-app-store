@@ -206,7 +206,18 @@ async function renderDmgIcon(fullPath, iconPath, outputPath) {
     if (process.platform === 'darwin') {
       await execFileAsync('sips', ['-s', 'format', 'png', sourcePath, '--out', outputPath])
     } else {
-      await execFileAsync('convert', [`${sourcePath}[0]`, outputPath])
+      const convertedDirectory = path.join(path.dirname(outputPath), `icns-${process.pid}`)
+      await mkdir(convertedDirectory, { recursive: true })
+      try {
+        await execFileAsync('icns2png', ['-x', '-o', convertedDirectory, sourcePath])
+        const pngFiles = await findFiles(convertedDirectory, (candidate) => /\.png$/i.test(candidate))
+        const candidates = await Promise.all(pngFiles.map(async (candidate) => ({ candidate, size: (await stat(candidate)).size })))
+        candidates.sort((a, b) => b.size - a.size)
+        if (!candidates[0]) throw new Error('ICNS did not contain a PNG representation')
+        await copyFile(candidates[0].candidate, outputPath)
+      } finally {
+        await rm(convertedDirectory, { recursive: true, force: true })
+      }
     }
   })
 }
@@ -320,6 +331,10 @@ async function parseApk(fileName) {
 async function parseIpa(fileName) {
   const fullPath = path.join(packageDirectory, fileName)
   const fileStat = await stat(fullPath)
+  const parsedAppInfo = await new AppInfoParser(fullPath).parse().catch((error) => {
+    console.warn(`Built-in IPA parser could not parse ${fileName}: ${error.message}`)
+    return {}
+  })
   const { stdout: fileList } = await execFileAsync('unzip', ['-Z1', fullPath], { maxBuffer: 32 * 1024 * 1024 })
   const entries = fileList.split('\n').map((entry) => entry.trim()).filter(Boolean)
   const infoPath = entries.find((entry) => /^Payload\/[^/]+\.app\/Info\.plist$/i.test(entry))
@@ -360,11 +375,11 @@ async function parseIpa(fileName) {
   }
   const item = {
     id: packageId(fileName),
-    name: info.CFBundleDisplayName || info.CFBundleName || path.basename(fileName, path.extname(fileName)),
-    packageName: info.CFBundleIdentifier || '',
-    versionCode: info.CFBundleVersion || '',
-    versionName: info.CFBundleShortVersionString || '',
-    minSdk: info.MinimumOSVersion || '',
+    name: info.CFBundleDisplayName || parsedAppInfo.CFBundleDisplayName || info.CFBundleName || parsedAppInfo.CFBundleName || path.basename(fileName, path.extname(fileName)),
+    packageName: info.CFBundleIdentifier || parsedAppInfo.CFBundleIdentifier || '',
+    versionCode: info.CFBundleVersion || parsedAppInfo.CFBundleVersion || '',
+    versionName: info.CFBundleShortVersionString || parsedAppInfo.CFBundleShortVersionString || '',
+    minSdk: info.MinimumOSVersion || parsedAppInfo.MinimumOSVersion || '',
     targetSdk: '',
     fileName,
     fullPath,
@@ -375,7 +390,7 @@ async function parseIpa(fileName) {
     platformLabel: 'iOS',
     ...architectureDetails(architectures, 'ios'),
   }
-  item.cachedIconPath = await cachedIconPath(item, async (outputPath) => {
+  item.cachedIconPath = await cacheBase64Icon(item, parsedAppInfo.icon) || await cachedIconPath(item, async (outputPath) => {
     const directory = await mkdtemp(path.join(tmpdir(), 'ipa-icon-'))
     try {
       await execFileAsync('unzip', ['-j', fullPath, iconPath, '-d', directory])
