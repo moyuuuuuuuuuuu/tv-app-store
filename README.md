@@ -1,12 +1,12 @@
 # TV App Store
 
-扫描指定目录中的 APK、IPA、DMG 和 EXE 文件，通过 Vue 页面展示平台、应用信息、处理器架构、应用图标并提供下载。Android/iOS 标记 32/64 位，Windows 标记 x86/x64/ARM，macOS 标记 Intel、M 系列或两者兼容。解包或转换得到的图标会持久化到独立缓存目录，页面请求图标时不再重复解包安装文件。
+扫描指定目录中的 APK、IPA、DMG、EXE 和 MSI 文件，通过 Vue 页面展示平台、应用信息、真实版本、处理器架构、最低系统版本、安装包内图标并提供下载。Android/iOS 标记 32/64 位，Windows 标记 x86/x64/ARM，macOS 标记 Intel、M 系列或两者兼容。解包或转换得到的真实图标会持久化到独立缓存目录，页面请求图标时不再重复解包安装文件。
 
 ## Docker Compose 运行
 
 ```bash
 mkdir -p packages data
-# 将 APK、IPA、DMG 或 EXE 文件放入 ./packages
+# 将 APK、IPA、DMG、EXE 或 MSI 文件放入 ./packages
 docker compose up -d --build
 ```
 

@@ -1,12 +1,15 @@
 import express from 'express'
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
+const require = createRequire(import.meta.url)
+const AppInfoParser = require('app-info-parser')
 const app = express()
 const port = Number(process.env.PORT || 3000)
 const packageDirectory = path.resolve(process.env.PACKAGE_DIR || process.env.APK_DIR || '/packages')
@@ -66,6 +69,20 @@ async function cachedIconPath(item, extractIcon) {
   }
 }
 
+async function cacheBase64Icon(item, dataUri) {
+  if (!dataUri) return ''
+  return cachedIconPath({ ...item, iconPath: 'embedded-base64' }, async (outputPath) => {
+    const base64 = dataUri.replace(/^data:image\/[^;]+;base64,/, '')
+    const sourcePath = `${outputPath}.source`
+    try {
+      await writeFile(sourcePath, Buffer.from(base64, 'base64'))
+      await execFileAsync('convert', [sourcePath, outputPath])
+    } finally {
+      await rm(sourcePath, { force: true })
+    }
+  })
+}
+
 async function findFile(directory, predicate) {
   const entries = await readdir(directory, { withFileTypes: true })
   for (const entry of entries) {
@@ -78,6 +95,16 @@ async function findFile(directory, predicate) {
     }
   }
   return ''
+}
+
+async function findFiles(directory, predicate, matches = []) {
+  const entries = await readdir(directory, { withFileTypes: true })
+  for (const entry of entries) {
+    const fullPath = path.join(directory, entry.name)
+    if (entry.isDirectory()) await findFiles(fullPath, predicate, matches)
+    else if (entry.isFile() && predicate(fullPath)) matches.push(fullPath)
+  }
+  return matches
 }
 
 async function readPlist(plistPath, keys) {
@@ -203,7 +230,7 @@ async function resolveIcon(fullPath, declaredIcons) {
   if (rasterDeclared.length) return rasterDeclared.at(-1)
 
   const preferredNames = declaredIcons.map((icon) => path.basename(icon, path.extname(icon)).toLowerCase())
-  const { stdout } = await execFileAsync('unzip', ['-Z1', fullPath], { maxBuffer: 8 * 1024 * 1024 })
+  const { stdout } = await execFileAsync('unzip', ['-Z1', fullPath], { maxBuffer: 32 * 1024 * 1024 })
   const rasterFiles = stdout
     .split('\n')
     .map((entry) => entry.trim())
@@ -216,10 +243,28 @@ async function resolveIcon(fullPath, declaredIcons) {
   return rasterFiles.sort((a, b) => iconScore(b, preferredNames) - iconScore(a, preferredNames))[0] || ''
 }
 
+async function readApkBadging(fullPath) {
+  try {
+    return (await execFileAsync(aapt, ['dump', 'badging', fullPath], { maxBuffer: 16 * 1024 * 1024 })).stdout
+  } catch (firstError) {
+    try {
+      return (await execFileAsync('aapt2', ['dump', 'badging', fullPath], { maxBuffer: 16 * 1024 * 1024 })).stdout
+    } catch {
+      throw firstError
+    }
+  }
+}
+
 async function parseApk(fileName) {
   const fullPath = path.join(packageDirectory, fileName)
   const fileStat = await stat(fullPath)
-  const { stdout } = await execFileAsync(aapt, ['dump', 'badging', fullPath], { maxBuffer: 4 * 1024 * 1024 })
+  let stdout = ''
+  let parsedInfo = {}
+  try { stdout = await readApkBadging(fullPath) }
+  catch (error) {
+    console.warn(`aapt could not parse ${fileName}, using built-in manifest parser: ${error.message}`)
+    parsedInfo = await new AppInfoParser(fullPath).parse()
+  }
   const lines = stdout.split('\n')
   const packageLine = lines.find((line) => line.startsWith('package:'))
   const appLine = lines.find((line) => line.startsWith('application-label:'))
@@ -231,19 +276,27 @@ async function parseApk(fileName) {
     return [attributeIcon, densityIcon].filter(Boolean)
   })
   const nativeCodeLine = lines.find((line) => line.startsWith('native-code:')) || ''
-  const architectures = [...nativeCodeLine.matchAll(/'([^']+)'/g)].map((match) => match[1])
+  let architectures = [...nativeCodeLine.matchAll(/'([^']+)'/g)].map((match) => match[1])
   const id = packageId(fileName)
 
-  const iconPath = await resolveIcon(fullPath, iconCandidates)
+  let iconPath = ''
+  try { iconPath = await resolveIcon(fullPath, iconCandidates) }
+  catch (error) { console.warn(`Unable to locate APK icon for ${fileName}: ${error.message}`) }
+  if (!architectures.length) {
+    try {
+      const { stdout: fileList } = await execFileAsync('unzip', ['-Z1', fullPath], { maxBuffer: 32 * 1024 * 1024 })
+      architectures = [...new Set([...fileList.matchAll(/(?:^|\n)lib\/([^/]+)\//g)].map((match) => match[1]))]
+    } catch { /* no native libraries means the APK is architecture-independent */ }
+  }
 
   const item = {
     id,
-    name: value(localizedAppLine, 'application-label-zh') || value(appLine, 'application-label') || path.basename(fileName, path.extname(fileName)),
-    packageName: value(packageLine, 'name'),
-    versionCode: value(packageLine, 'versionCode'),
-    versionName: value(packageLine, 'versionName'),
-    minSdk: value(lines.find((line) => line.startsWith('sdkVersion:')), 'sdkVersion'),
-    targetSdk: value(lines.find((line) => line.startsWith('targetSdkVersion:')), 'targetSdkVersion'),
+    name: value(localizedAppLine, 'application-label-zh') || value(appLine, 'application-label') || parsedInfo.application?.label || path.basename(fileName, path.extname(fileName)),
+    packageName: value(packageLine, 'name') || parsedInfo.package || '',
+    versionCode: value(packageLine, 'versionCode') || parsedInfo.versionCode || '',
+    versionName: value(packageLine, 'versionName') || parsedInfo.versionName || '',
+    minSdk: value(lines.find((line) => line.startsWith('sdkVersion:')), 'sdkVersion') || parsedInfo.usesSdk?.minSdkVersion || '',
+    targetSdk: value(lines.find((line) => line.startsWith('targetSdkVersion:')), 'targetSdkVersion') || parsedInfo.usesSdk?.targetSdkVersion || '',
     fileName,
     fullPath,
     size: fileStat.size,
@@ -253,7 +306,7 @@ async function parseApk(fileName) {
     platformLabel: 'Android',
     ...architectureDetails(architectures.length ? architectures : ['universal-32', 'universal-64'], 'android'),
   }
-  item.cachedIconPath = await cachedIconPath(item, async (outputPath) => {
+  item.cachedIconPath = await cacheBase64Icon(item, parsedInfo.icon) || await cachedIconPath(item, async (outputPath) => {
     const directory = await mkdtemp(path.join(tmpdir(), 'apk-icon-'))
     try {
       await execFileAsync('unzip', ['-j', fullPath, iconPath, '-d', directory])
@@ -267,7 +320,7 @@ async function parseApk(fileName) {
 async function parseIpa(fileName) {
   const fullPath = path.join(packageDirectory, fileName)
   const fileStat = await stat(fullPath)
-  const { stdout: fileList } = await execFileAsync('unzip', ['-Z1', fullPath], { maxBuffer: 8 * 1024 * 1024 })
+  const { stdout: fileList } = await execFileAsync('unzip', ['-Z1', fullPath], { maxBuffer: 32 * 1024 * 1024 })
   const entries = fileList.split('\n').map((entry) => entry.trim()).filter(Boolean)
   const infoPath = entries.find((entry) => /^Payload\/[^/]+\.app\/Info\.plist$/i.test(entry))
   let info = {}
@@ -368,25 +421,115 @@ function parsePeArchitecture(buffer) {
   return ({ 0x014c: ['x86'], 0x8664: ['x86_64'], 0x01c0: ['arm'], 0xaa64: ['arm64'] })[buffer.readUInt16LE(peOffset + 4)] || []
 }
 
-async function parseExe(fileName) {
-  const fullPath = path.join(packageDirectory, fileName)
-  const fileStat = await stat(fullPath)
-  const item = {
-    id: packageId(fileName), name: path.basename(fileName, path.extname(fileName)), packageName: '',
-    versionCode: '', versionName: '', minSdk: '', targetSdk: '', fileName, fullPath,
-    size: fileStat.size, modifiedAt: fileStat.mtime.toISOString(), iconPath: 'embedded',
-    platform: 'windows', platformLabel: 'Windows',
-    ...architectureDetails(parsePeArchitecture((await readFile(fullPath)).subarray(0, 4096)), 'windows'),
+function parsePeMinimumWindows(buffer) {
+  if (buffer.length < 64 || buffer.toString('ascii', 0, 2) !== 'MZ') return ''
+  const peOffset = buffer.readUInt32LE(0x3c)
+  const optionalHeader = peOffset + 24
+  if (optionalHeader + 44 > buffer.length || buffer.toString('ascii', peOffset, peOffset + 4) !== 'PE\0\0') return ''
+  const version = `${buffer.readUInt16LE(optionalHeader + 40)}.${buffer.readUInt16LE(optionalHeader + 42)}`
+  return ({ '5.0': '2000', '5.1': 'XP', '5.2': 'XP x64', '6.0': 'Vista', '6.1': '7', '6.2': '8', '6.3': '8.1', '10.0': '10' })[version]
+    || (version !== '0.0' ? `NT ${version}` : '')
+}
+
+async function readWindowsVersionInfo(fullPath) {
+  try {
+    const { stdout } = await execFileAsync('exiftool', ['-json', '-ProductName', '-FileDescription', '-ProductVersion', '-FileVersion', fullPath], { maxBuffer: 4 * 1024 * 1024 })
+    return JSON.parse(stdout)[0] || {}
+  } catch { return {} }
+}
+
+async function readMsiProperties(fullPath) {
+  try {
+    const { stdout } = await execFileAsync('msiinfo', ['export', fullPath, 'Property'], { maxBuffer: 4 * 1024 * 1024 })
+    return Object.fromEntries(stdout.split(/\r?\n/).map((line) => line.split('\t')).filter((parts) => parts.length >= 2))
+  } catch { return {} }
+}
+
+async function withWindowsPayload(fullPath, type, callback) {
+  const directory = await mkdtemp(path.join(tmpdir(), 'windows-package-'))
+  try {
+    if (type === 'msi') await execFileAsync('msiextract', ['-C', directory, fullPath], { maxBuffer: 32 * 1024 * 1024 })
+    else await execFileAsync('7z', ['x', '-y', `-o${directory}`, fullPath], { maxBuffer: 32 * 1024 * 1024 })
+    return await callback(directory)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
   }
-  item.cachedIconPath = await cachedIconPath(item, async (outputPath) => {
-    const directory = await mkdtemp(path.join(tmpdir(), 'exe-icon-'))
+}
+
+async function inspectWindowsBinaries(directory) {
+  const binaries = await findFiles(directory, (candidate) => /\.(?:exe|dll)$/i.test(candidate))
+  const candidates = await Promise.all(binaries.map(async (candidate) => ({ candidate, size: (await stat(candidate)).size })))
+  candidates.sort((a, b) => b.size - a.size)
+  for (const { candidate } of candidates.slice(0, 20)) {
+    const buffer = await readFile(candidate)
+    const architectures = parsePeArchitecture(buffer)
+    if (architectures.length) return { architectures, minSdk: parsePeMinimumWindows(buffer), iconSource: candidate }
+  }
+  return { architectures: [], minSdk: '', iconSource: '' }
+}
+
+async function cacheWindowsIcon(item, fullPath, type, payloadIconSource = '') {
+  return cachedIconPath(item, async (outputPath) => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'windows-icon-'))
     try {
-      await execFileAsync('wrestool', ['-x', '-t', '14', '-o', directory, fullPath])
-      const iconFile = await findFile(directory, (candidate) => /\.ico$/i.test(candidate))
-      if (!iconFile) throw new Error('no embedded icon')
-      await execFileAsync('convert', [`${iconFile}[0]`, outputPath])
+      let iconSource = payloadIconSource
+      if (!iconSource) {
+        await execFileAsync('wrestool', ['-x', '-t', '14', '-o', directory, fullPath])
+        iconSource = await findFile(directory, (candidate) => /\.ico$/i.test(candidate))
+      }
+      if (!iconSource && type === 'msi') throw new Error('no application binary with embedded icon')
+      if (!iconSource) throw new Error('no embedded icon')
+      if (/\.ico$/i.test(iconSource)) await execFileAsync('convert', [`${iconSource}[0]`, outputPath])
+      else {
+        const resourceDirectory = path.join(directory, 'resource')
+        await mkdir(resourceDirectory)
+        await execFileAsync('wrestool', ['-x', '-t', '14', '-o', resourceDirectory, iconSource])
+        const iconFile = await findFile(resourceDirectory, (candidate) => /\.ico$/i.test(candidate))
+        if (!iconFile) throw new Error('no embedded icon')
+        await execFileAsync('convert', [`${iconFile}[0]`, outputPath])
+      }
     } finally { await rm(directory, { recursive: true, force: true }) }
   })
+}
+
+async function parseWindowsPackage(fileName, type) {
+  const fullPath = path.join(packageDirectory, fileName)
+  const fileStat = await stat(fullPath)
+  const outerBuffer = type === 'exe' ? await readFile(fullPath) : Buffer.alloc(0)
+  const versionInfo = type === 'exe' ? await readWindowsVersionInfo(fullPath) : await readMsiProperties(fullPath)
+  let binaryInfo = {
+    architectures: type === 'exe' ? parsePeArchitecture(outerBuffer) : [],
+    minSdk: type === 'exe' ? parsePeMinimumWindows(outerBuffer) : '',
+    iconSource: '',
+  }
+  let cachedIcon = ''
+  try {
+    await withWindowsPayload(fullPath, type, async (directory) => {
+      const payloadInfo = await inspectWindowsBinaries(directory)
+      if (payloadInfo.architectures.length) binaryInfo = payloadInfo
+      const iconItem = { fileName, size: fileStat.size, modifiedAt: fileStat.mtime.toISOString(), iconPath: 'embedded' }
+      cachedIcon = await cacheWindowsIcon(iconItem, fullPath, type, payloadInfo.iconSource)
+    })
+  } catch (error) {
+    console.warn(`Unable to inspect ${fileName} payload: ${error.message}`)
+  }
+  if (!cachedIcon && type === 'exe') {
+    const iconItem = { fileName, size: fileStat.size, modifiedAt: fileStat.mtime.toISOString(), iconPath: 'embedded' }
+    cachedIcon = await cacheWindowsIcon(iconItem, fullPath, type)
+  }
+  const productName = versionInfo.ProductName || ''
+  const fileDescription = versionInfo.FileDescription || ''
+  const name = /operating system/i.test(productName) && fileDescription
+    ? fileDescription : productName || fileDescription || path.basename(fileName, path.extname(fileName))
+  const version = versionInfo.ProductVersion || versionInfo.FileVersion || ''
+  const item = {
+    id: packageId(fileName), name, packageName: '',
+    versionCode: '', versionName: version, minSdk: binaryInfo.minSdk, targetSdk: '', fileName, fullPath,
+    size: fileStat.size, modifiedAt: fileStat.mtime.toISOString(), iconPath: 'embedded',
+    platform: 'windows', platformLabel: 'Windows',
+    ...architectureDetails(binaryInfo.architectures, 'windows'),
+  }
+  item.cachedIconPath = cachedIcon
   item.hasIcon = Boolean(item.cachedIconPath)
   return item
 }
@@ -396,14 +539,14 @@ function parsePackage(fileName) {
   if (extension === '.apk') return parseApk(fileName)
   if (extension === '.ipa') return parseIpa(fileName)
   if (extension === '.dmg') return parseDmg(fileName)
-  return parseExe(fileName)
+  return parseWindowsPackage(fileName, extension.slice(1))
 }
 
 async function fallbackPackage(fileName, error) {
   const fullPath = path.join(packageDirectory, fileName)
   const fileStat = await stat(fullPath)
   const extension = path.extname(fileName).toLowerCase()
-  const platform = ({ '.apk': 'android', '.ipa': 'ios', '.dmg': 'macos', '.exe': 'windows' })[extension]
+  const platform = ({ '.apk': 'android', '.ipa': 'ios', '.dmg': 'macos', '.exe': 'windows', '.msi': 'windows' })[extension]
   const platformLabel = ({ android: 'Android', ios: 'iOS', macos: 'macOS', windows: 'Windows' })[platform]
   console.warn(`Unable to fully parse ${fileName}: ${error.message}`)
   return {
@@ -417,7 +560,7 @@ async function fallbackPackage(fileName, error) {
 async function scan() {
   const entries = await readdir(packageDirectory, { withFileTypes: true })
   const packageFiles = entries
-    .filter((entry) => entry.isFile() && /\.(?:apk|ipa|dmg|exe)$/i.test(entry.name))
+    .filter((entry) => entry.isFile() && /\.(?:apk|ipa|dmg|exe|msi)$/i.test(entry.name))
     .map((entry) => entry.name)
   const parsed = await Promise.all(packageFiles.map(async (fileName) => {
     try { return await parsePackage(fileName) }

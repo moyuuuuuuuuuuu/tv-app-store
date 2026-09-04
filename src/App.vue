@@ -74,19 +74,19 @@ onMounted(loadApps)
     <div v-else-if="!filteredApps.length" class="empty">
       <div class="empty-icon">APP</div>
       <h2>{{ query ? '没有匹配的应用' : '目录中还没有安装包' }}</h2>
-      <p>{{ query ? '试试其他关键词' : '将 APK、IPA、DMG 或 EXE 文件放入挂载目录后点击刷新' }}</p>
+      <p>{{ query ? '试试其他关键词' : '将 APK、IPA、DMG、EXE 或 MSI 文件放入挂载目录后点击刷新' }}</p>
     </div>
 
     <section v-else class="grid">
       <article v-for="app in filteredApps" :key="app.id" class="card">
         <img v-if="app.hasIcon" class="app-icon" :src="`/api/apps/${app.id}/icon?v=${encodeURIComponent(app.modifiedAt || app.size)}`" alt="" />
-        <div v-else class="app-icon fallback">{{ app.name?.slice(0, 1)?.toUpperCase() || 'A' }}</div>
+        <div v-else class="app-icon fallback" title="未能从安装包提取图标" aria-label="未能从安装包提取图标">▦</div>
         <div class="card-main">
           <h2 :title="app.name">{{ app.name }}</h2>
           <p class="package" :title="app.packageName">{{ app.packageName }}</p>
           <div class="tags">
             <span class="platform" :class="app.platform">{{ app.platformLabel }}</span>
-            <span>v{{ app.versionName || app.versionCode || '-' }}</span>
+            <span>{{ app.versionName || app.versionCode ? `v${app.versionName || app.versionCode}` : '版本未知' }}</span>
             <span>{{ formatSize(app.size) }}</span>
             <span v-if="app.architectureLabel" class="architecture">{{ app.architectureLabel }}</span>
             <span v-if="app.minSdk">{{ minimumSystemLabel(app) }} {{ app.minSdk }}+</span>
