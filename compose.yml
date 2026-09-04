@@ -4,7 +4,7 @@ services:
     container_name: tv-app-store
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "9300:3000"
     volumes:
       - "./packages:/packages:ro"
       - "./data:/app/data"
