@@ -1,4 +1,6 @@
 node_modules/
 dist/
 apks/*.apk
+packages/
+data/
 .DS_Store

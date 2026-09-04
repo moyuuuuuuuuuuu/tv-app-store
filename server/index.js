@@ -1,6 +1,7 @@
 import express from 'express'
 import { execFile } from 'node:child_process'
-import { mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -8,7 +9,8 @@ import { promisify } from 'node:util'
 const execFileAsync = promisify(execFile)
 const app = express()
 const port = Number(process.env.PORT || 3000)
-const apkDirectory = path.resolve(process.env.APK_DIR || '/apks')
+const packageDirectory = path.resolve(process.env.PACKAGE_DIR || process.env.APK_DIR || '/packages')
+const iconCacheDirectory = path.resolve(process.env.ICON_CACHE_DIR || '/app/data/icons')
 const aapt = process.env.AAPT_PATH || 'aapt'
 let cache = new Map()
 
@@ -22,6 +24,46 @@ function isRasterIcon(filePath) {
 
 function isCgbiPng(buffer) {
   return buffer.subarray(0, 128).includes(Buffer.from('CgBI'))
+}
+
+function packageId(fileName) {
+  return Buffer.from(fileName).toString('base64url')
+}
+
+function architectureDetails(architectures, platform) {
+  const normalized = [...new Set(architectures.map((item) => item.toLowerCase()))]
+  const has64 = normalized.some((item) => /64|arm64|aarch64/.test(item))
+  const has32 = normalized.some((item) => /^(?:x86|armeabi(?:-v7a)?|armv7|arm|i[3-6]86|universal-32)$/.test(item))
+  let label = '架构未知'
+  if (platform === 'macos') {
+    const intel = normalized.some((item) => /x86_64|amd64/.test(item))
+    const apple = normalized.some((item) => /arm64|aarch64/.test(item))
+    label = intel && apple ? 'Intel + M 系列' : apple ? 'M 系列' : intel ? 'Intel' : '架构未知'
+  } else if (has32 && has64) label = '32 位 + 64 位'
+  else if (has64) label = '64 位'
+  else if (has32) label = '32 位'
+  return { architectures: normalized, architectureLabel: label }
+}
+
+async function cachedIconPath(item, extractIcon) {
+  if (!item.iconPath) return ''
+  await mkdir(iconCacheDirectory, { recursive: true })
+  const fingerprint = createHash('sha256')
+    .update(`${item.fileName}:${item.size}:${item.modifiedAt}:${item.iconPath}`)
+    .digest('hex').slice(0, 24)
+  const outputPath = path.join(iconCacheDirectory, `${fingerprint}.png`)
+  if (await stat(outputPath).then(() => true).catch(() => false)) return outputPath
+  const temporaryPath = `${outputPath}.${process.pid}.tmp.png`
+  try {
+    await extractIcon(temporaryPath)
+    await copyFile(temporaryPath, outputPath)
+    return outputPath
+  } catch (error) {
+    console.warn(`Unable to cache icon for ${item.fileName}: ${error.message}`)
+    return ''
+  } finally {
+    await rm(temporaryPath, { force: true }).catch(() => {})
+  }
 }
 
 async function findFile(directory, predicate) {
@@ -175,7 +217,7 @@ async function resolveIcon(fullPath, declaredIcons) {
 }
 
 async function parseApk(fileName) {
-  const fullPath = path.join(apkDirectory, fileName)
+  const fullPath = path.join(packageDirectory, fileName)
   const fileStat = await stat(fullPath)
   const { stdout } = await execFileAsync(aapt, ['dump', 'badging', fullPath], { maxBuffer: 4 * 1024 * 1024 })
   const lines = stdout.split('\n')
@@ -188,11 +230,13 @@ async function parseApk(fileName) {
     const densityIcon = line.match(/^application-icon-[^:]+:\s*'([^']+)'/)?.[1]
     return [attributeIcon, densityIcon].filter(Boolean)
   })
-  const id = Buffer.from(fileName).toString('base64url')
+  const nativeCodeLine = lines.find((line) => line.startsWith('native-code:')) || ''
+  const architectures = [...nativeCodeLine.matchAll(/'([^']+)'/g)].map((match) => match[1])
+  const id = packageId(fileName)
 
   const iconPath = await resolveIcon(fullPath, iconCandidates)
 
-  return {
+  const item = {
     id,
     name: value(localizedAppLine, 'application-label-zh') || value(appLine, 'application-label') || path.basename(fileName, path.extname(fileName)),
     packageName: value(packageLine, 'name'),
@@ -205,14 +249,23 @@ async function parseApk(fileName) {
     size: fileStat.size,
     modifiedAt: fileStat.mtime.toISOString(),
     iconPath,
-    hasIcon: Boolean(iconPath),
     platform: 'android',
     platformLabel: 'Android',
+    ...architectureDetails(architectures.length ? architectures : ['universal-32', 'universal-64'], 'android'),
   }
+  item.cachedIconPath = await cachedIconPath(item, async (outputPath) => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'apk-icon-'))
+    try {
+      await execFileAsync('unzip', ['-j', fullPath, iconPath, '-d', directory])
+      await execFileAsync('convert', [path.join(directory, path.basename(iconPath)), outputPath])
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+  item.hasIcon = Boolean(item.cachedIconPath)
+  return item
 }
 
 async function parseIpa(fileName) {
-  const fullPath = path.join(apkDirectory, fileName)
+  const fullPath = path.join(packageDirectory, fileName)
   const fileStat = await stat(fullPath)
   const { stdout: fileList } = await execFileAsync('unzip', ['-Z1', fullPath], { maxBuffer: 8 * 1024 * 1024 })
   const entries = fileList.split('\n').map((entry) => entry.trim()).filter(Boolean)
@@ -227,7 +280,7 @@ async function parseIpa(fileName) {
       const script = [
         'import json, plistlib, sys',
         'with open(sys.argv[1], "rb") as f: p = plistlib.load(f)',
-        'keys = ["CFBundleDisplayName", "CFBundleName", "CFBundleIdentifier", "CFBundleShortVersionString", "CFBundleVersion", "MinimumOSVersion"]',
+        'keys = ["CFBundleDisplayName", "CFBundleName", "CFBundleIdentifier", "CFBundleShortVersionString", "CFBundleVersion", "MinimumOSVersion", "CFBundleExecutable"]',
         'print(json.dumps({k: p.get(k, "") for k in keys}, ensure_ascii=False))',
       ].join('\n')
       const { stdout } = await execFileAsync('python3', ['-c', script, plistPath])
@@ -243,8 +296,17 @@ async function parseIpa(fileName) {
   )
   const iconPath = iconCandidates.sort((a, b) => iconScore(b, ['appicon']) - iconScore(a, ['appicon']))[0] || ''
 
-  return {
-    id: Buffer.from(fileName).toString('base64url'),
+  const executablePath = info.CFBundleExecutable ? `${appRoot}${info.CFBundleExecutable}` : ''
+  let architectures = []
+  if (executablePath) {
+    const directory = await mkdtemp(path.join(tmpdir(), 'ipa-bin-'))
+    try {
+      await execFileAsync('unzip', ['-j', fullPath, executablePath, '-d', directory])
+      architectures = parseMachOArchitectures((await readFile(path.join(directory, path.basename(executablePath)))).subarray(0, 4096))
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  }
+  const item = {
+    id: packageId(fileName),
     name: info.CFBundleDisplayName || info.CFBundleName || path.basename(fileName, path.extname(fileName)),
     packageName: info.CFBundleIdentifier || '',
     versionCode: info.CFBundleVersion || '',
@@ -256,64 +318,120 @@ async function parseIpa(fileName) {
     size: fileStat.size,
     modifiedAt: fileStat.mtime.toISOString(),
     iconPath,
-    hasIcon: Boolean(iconPath),
     platform: 'ios',
     platformLabel: 'iOS',
+    ...architectureDetails(architectures, 'ios'),
   }
+  item.cachedIconPath = await cachedIconPath(item, async (outputPath) => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'ipa-icon-'))
+    try {
+      await execFileAsync('unzip', ['-j', fullPath, iconPath, '-d', directory])
+      const source = path.join(directory, path.basename(iconPath))
+      if (isCgbiPng(await readFile(source))) await execFileAsync('pngcrush', ['-q', '-revert-iphone-optimizations', source, outputPath])
+      else await execFileAsync('convert', [source, outputPath])
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+  item.hasIcon = Boolean(item.cachedIconPath)
+  return item
 }
 
 async function parseDmg(fileName) {
-  const fullPath = path.join(apkDirectory, fileName)
+  const fullPath = path.join(packageDirectory, fileName)
   const fileStat = await stat(fullPath)
   const { info, architectures, iconPath } = await inspectDmg(fullPath)
-  const architectureLabel = architectures.includes('arm64') && architectures.includes('x86_64')
-    ? '通用（Intel + Apple 芯片）'
-    : architectures.includes('arm64') ? 'Apple 芯片'
-      : architectures.includes('x86_64') ? 'Intel' : ''
-  return {
-    id: Buffer.from(fileName).toString('base64url'),
+  const item = {
+    id: packageId(fileName),
     name: info.CFBundleDisplayName || info.CFBundleName || path.basename(fileName, path.extname(fileName)),
     packageName: info.CFBundleIdentifier || '',
     versionCode: info.CFBundleVersion || '',
     versionName: info.CFBundleShortVersionString || '',
     minSdk: info.LSMinimumSystemVersion || '',
     targetSdk: '',
-    architectures,
-    architectureLabel,
+    ...architectureDetails(architectures, 'macos'),
     fileName,
     fullPath,
     size: fileStat.size,
     modifiedAt: fileStat.mtime.toISOString(),
     iconPath,
-    hasIcon: Boolean(iconPath),
     platform: 'macos',
     platformLabel: 'macOS',
   }
+  item.cachedIconPath = await cachedIconPath(item, (outputPath) => renderDmgIcon(fullPath, iconPath, outputPath))
+  item.hasIcon = Boolean(item.cachedIconPath)
+  return item
+}
+
+function parsePeArchitecture(buffer) {
+  if (buffer.length < 64 || buffer.toString('ascii', 0, 2) !== 'MZ') return []
+  const peOffset = buffer.readUInt32LE(0x3c)
+  if (peOffset + 6 > buffer.length || buffer.toString('ascii', peOffset, peOffset + 4) !== 'PE\0\0') return []
+  return ({ 0x014c: ['x86'], 0x8664: ['x86_64'], 0x01c0: ['arm'], 0xaa64: ['arm64'] })[buffer.readUInt16LE(peOffset + 4)] || []
+}
+
+async function parseExe(fileName) {
+  const fullPath = path.join(packageDirectory, fileName)
+  const fileStat = await stat(fullPath)
+  const item = {
+    id: packageId(fileName), name: path.basename(fileName, path.extname(fileName)), packageName: '',
+    versionCode: '', versionName: '', minSdk: '', targetSdk: '', fileName, fullPath,
+    size: fileStat.size, modifiedAt: fileStat.mtime.toISOString(), iconPath: 'embedded',
+    platform: 'windows', platformLabel: 'Windows',
+    ...architectureDetails(parsePeArchitecture((await readFile(fullPath)).subarray(0, 4096)), 'windows'),
+  }
+  item.cachedIconPath = await cachedIconPath(item, async (outputPath) => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'exe-icon-'))
+    try {
+      await execFileAsync('wrestool', ['-x', '-t', '14', '-o', directory, fullPath])
+      const iconFile = await findFile(directory, (candidate) => /\.ico$/i.test(candidate))
+      if (!iconFile) throw new Error('no embedded icon')
+      await execFileAsync('convert', [`${iconFile}[0]`, outputPath])
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+  item.hasIcon = Boolean(item.cachedIconPath)
+  return item
 }
 
 function parsePackage(fileName) {
   const extension = path.extname(fileName).toLowerCase()
   if (extension === '.apk') return parseApk(fileName)
   if (extension === '.ipa') return parseIpa(fileName)
-  return parseDmg(fileName)
+  if (extension === '.dmg') return parseDmg(fileName)
+  return parseExe(fileName)
+}
+
+async function fallbackPackage(fileName, error) {
+  const fullPath = path.join(packageDirectory, fileName)
+  const fileStat = await stat(fullPath)
+  const extension = path.extname(fileName).toLowerCase()
+  const platform = ({ '.apk': 'android', '.ipa': 'ios', '.dmg': 'macos', '.exe': 'windows' })[extension]
+  const platformLabel = ({ android: 'Android', ios: 'iOS', macos: 'macOS', windows: 'Windows' })[platform]
+  console.warn(`Unable to fully parse ${fileName}: ${error.message}`)
+  return {
+    id: packageId(fileName), name: path.basename(fileName, extension), packageName: '',
+    versionCode: '', versionName: '', minSdk: '', targetSdk: '', architectures: [], architectureLabel: '架构未知',
+    fileName, fullPath, size: fileStat.size, modifiedAt: fileStat.mtime.toISOString(),
+    iconPath: '', cachedIconPath: '', hasIcon: false, platform, platformLabel, parseWarning: '安装包信息未能完整解析',
+  }
 }
 
 async function scan() {
-  const entries = await readdir(apkDirectory, { withFileTypes: true })
+  const entries = await readdir(packageDirectory, { withFileTypes: true })
   const packageFiles = entries
-    .filter((entry) => entry.isFile() && /\.(?:apk|ipa|dmg)$/i.test(entry.name))
+    .filter((entry) => entry.isFile() && /\.(?:apk|ipa|dmg|exe)$/i.test(entry.name))
     .map((entry) => entry.name)
-  const results = await Promise.allSettled(packageFiles.map(parsePackage))
-  const parsed = results.filter((result) => result.status === 'fulfilled').map((result) => result.value)
+  const parsed = await Promise.all(packageFiles.map(async (fileName) => {
+    try { return await parsePackage(fileName) }
+    catch (error) { return fallbackPackage(fileName, error) }
+  }))
   cache = new Map(parsed.map((item) => [item.id, item]))
   return parsed.sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'))
 }
 
-app.get('/api/health', (_request, response) => response.json({ status: 'ok', apkDirectory }))
+app.get('/api/health', (_request, response) => response.json({ status: 'ok', packageDirectory, iconCacheDirectory }))
 app.get('/api/apps', async (_request, response) => {
   try {
     const apps = await scan()
-    response.json({ apps: apps.map(({ fullPath, iconPath, ...item }) => item) })
+    response.json({ apps: apps.map(({ fullPath, iconPath, cachedIconPath, ...item }) => item) })
   } catch (error) {
     response.status(error.code === 'ENOENT' ? 404 : 500).json({ error: error.message })
   }
@@ -326,41 +444,10 @@ app.get('/api/apps/:id/icon', async (request, response) => {
       await scan()
       item = cache.get(request.params.id)
     }
-    if (!item?.iconPath) return response.sendStatus(404)
-    const directory = await mkdtemp(path.join(tmpdir(), 'apk-icon-'))
-    try {
-      if (item.platform === 'macos') {
-        const convertedFile = path.join(directory, 'icon.png')
-        await renderDmgIcon(item.fullPath, item.iconPath, convertedFile)
-        response.type('image/png')
-        response.set('Cache-Control', 'public, max-age=3600')
-        response.send(await readFile(convertedFile))
-        return
-      }
-      await execFileAsync('unzip', ['-j', item.fullPath, item.iconPath, '-d', directory])
-      const iconFile = path.join(directory, path.basename(item.iconPath))
-      const extension = path.extname(iconFile).toLowerCase()
-      let responseFile = iconFile
-
-      // iOS stores many app icons as CgBI PNGs. Browsers cannot decode these
-      // directly, so restore them to regular PNG before sending the response.
-      if (item.platform === 'ios' && extension === '.png') {
-        const originalIcon = await readFile(iconFile)
-        const convertedFile = path.join(directory, `converted-${path.basename(iconFile)}`)
-        if (isCgbiPng(originalIcon)) {
-          await execFileAsync('pngcrush', ['-q', '-revert-iphone-optimizations', iconFile, convertedFile])
-          const convertedIcon = await readFile(convertedFile)
-          if (isCgbiPng(convertedIcon)) throw new Error('CgBI icon conversion did not produce a browser-compatible PNG')
-          responseFile = convertedFile
-        }
-      }
-
-      response.type(extension === '.webp' ? 'image/webp' : extension === '.jpg' || extension === '.jpeg' ? 'image/jpeg' : 'image/png')
-      response.set('Cache-Control', 'public, max-age=3600')
-      response.send(await readFile(responseFile))
-    } finally {
-      await rm(directory, { recursive: true, force: true })
-    }
+    if (!item?.cachedIconPath) return response.sendStatus(404)
+    response.type('image/png')
+    response.set('Cache-Control', 'public, max-age=31536000, immutable')
+    response.send(await readFile(item.cachedIconPath))
   } catch (error) {
     console.warn(`Unable to extract icon for ${request.params.id}: ${error.message}`)
     if (!response.headersSent) response.sendStatus(404)
@@ -386,4 +473,4 @@ app.get('/api/apps/:id/download', async (request, response) => {
 
 app.use(express.static('dist'))
 app.get('/*path', (_request, response) => response.sendFile(path.resolve('dist/index.html')))
-app.listen(port, '0.0.0.0', () => console.log(`TV App Store listening on http://0.0.0.0:${port}; APK_DIR=${apkDirectory}`))
+app.listen(port, '0.0.0.0', () => console.log(`TV App Store listening on http://0.0.0.0:${port}; PACKAGE_DIR=${packageDirectory}`))

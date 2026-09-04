@@ -26,6 +26,10 @@ function formatSize(bytes) {
   return `${size.toFixed(index > 1 ? 1 : 0)} ${units[index]}`
 }
 
+function minimumSystemLabel(app) {
+  return ({ android: 'Android', ios: 'iOS', macos: 'macOS' })[app.platform] || app.platformLabel
+}
+
 async function loadApps() {
   loading.value = true
   error.value = ''
@@ -48,9 +52,9 @@ onMounted(loadApps)
   <main>
     <header class="hero">
       <div>
-        <p class="eyebrow">LOCAL APK LIBRARY</p>
-        <h1>电视应用仓库</h1>
-        <p class="subtitle">浏览挂载目录中的 Android 与 Apple 安装包</p>
+        <p class="eyebrow">LOCAL APP LIBRARY</p>
+        <h1>软件安装包仓库</h1>
+        <p class="subtitle">统一浏览 Android、iOS、macOS 与 Windows 安装包</p>
       </div>
       <button class="refresh" :disabled="loading" @click="loadApps">
         <span :class="{ spin: loading }">↻</span> 刷新目录
@@ -66,11 +70,11 @@ onMounted(loadApps)
     </section>
 
     <div v-if="error" class="notice error">{{ error }}</div>
-    <div v-else-if="loading" class="notice">正在解析 APK 信息…</div>
+    <div v-else-if="loading" class="notice">正在解析安装包信息并准备图标…</div>
     <div v-else-if="!filteredApps.length" class="empty">
-      <div class="empty-icon">APK</div>
-      <h2>{{ query ? '没有匹配的应用' : '目录中还没有 APK' }}</h2>
-      <p>{{ query ? '试试其他关键词' : '将 APK、IPA 或 DMG 文件放入挂载目录后点击刷新' }}</p>
+      <div class="empty-icon">APP</div>
+      <h2>{{ query ? '没有匹配的应用' : '目录中还没有安装包' }}</h2>
+      <p>{{ query ? '试试其他关键词' : '将 APK、IPA、DMG 或 EXE 文件放入挂载目录后点击刷新' }}</p>
     </div>
 
     <section v-else class="grid">
@@ -85,7 +89,8 @@ onMounted(loadApps)
             <span>v{{ app.versionName || app.versionCode || '-' }}</span>
             <span>{{ formatSize(app.size) }}</span>
             <span v-if="app.architectureLabel" class="architecture">{{ app.architectureLabel }}</span>
-            <span v-if="app.minSdk">{{ app.platform === 'android' ? 'Android' : 'iOS' }} {{ app.minSdk }}+</span>
+            <span v-if="app.minSdk">{{ minimumSystemLabel(app) }} {{ app.minSdk }}+</span>
+            <span v-if="app.parseWarning" class="warning" :title="app.parseWarning">信息待完善</span>
           </div>
         </div>
         <footer>

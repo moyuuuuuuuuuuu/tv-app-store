@@ -6,7 +6,9 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - "./apks:/apks:ro"
+      - "./packages:/packages:ro"
+      - "./data:/app/data"
     environment:
       PORT: 3000
-      APK_DIR: /apks
+      PACKAGE_DIR: /packages
+      ICON_CACHE_DIR: /app/data/icons

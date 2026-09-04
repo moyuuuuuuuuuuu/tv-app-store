@@ -1,12 +1,12 @@
 # TV App Store
 
-扫描指定目录中的 APK、IPA 和 DMG 文件，通过 Vue 页面展示平台、应用信息、应用图标并提供下载。APK 使用 `aapt` 解析，IPA 从 `Info.plist` 读取元数据，并自动将苹果 CgBI 图标转换为浏览器可显示的 PNG；DMG 会读取应用元数据和 ICNS 图标，并识别 Intel（`x86_64`）、Apple 芯片（`arm64`）或通用架构。
+扫描指定目录中的 APK、IPA、DMG 和 EXE 文件，通过 Vue 页面展示平台、应用信息、处理器架构、应用图标并提供下载。Android/iOS 标记 32/64 位，Windows 标记 x86/x64/ARM，macOS 标记 Intel、M 系列或两者兼容。解包或转换得到的图标会持久化到独立缓存目录，页面请求图标时不再重复解包安装文件。
 
 ## Docker Compose 运行
 
 ```bash
-mkdir -p apks
-# 将 APK 文件放入 ./apks
+mkdir -p packages data
+# 将 APK、IPA、DMG 或 EXE 文件放入 ./packages
 docker compose up -d --build
 ```
 
@@ -22,7 +22,8 @@ docker compose up -d
 默认映射关系：
 
 - Web 端口：宿主机 `3000` → 容器 `3000`
-- APK 目录：宿主机 `./apks` → 容器 `/apks`（只读）
+- 安装包目录：宿主机 `./packages` → 容器 `/packages`（只读）
+- 图标缓存：宿主机 `./data` → 容器 `/app/data`（可写）
 
 修改宿主机端口或 APK 目录：
 
@@ -30,14 +31,15 @@ docker compose up -d
 ports:
   - "8080:3000"
 volumes:
-  - "/mnt/storage/apks:/apks:ro"
+  - "/mnt/storage/packages:/packages:ro"
+  - "/mnt/storage/tv-app-store-data:/app/data"
 ```
 
 也可直接运行：
 
 ```bash
 docker build -t tv-app-store .
-docker run -d --name tv-app-store -p 3000:3000 -v /你的/APK目录:/apks:ro tv-app-store
+docker run -d --name tv-app-store -p 3000:3000 -v /你的安装包目录:/packages:ro -v /你的缓存目录:/app/data tv-app-store
 ```
 
 健康检查接口：`GET /api/health`。
